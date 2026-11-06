@@ -10,6 +10,7 @@ from sanic.exceptions import (
     RangeNotSatisfiable,
 )
 from sanic.models.protocol_types import Range
+from sanic.settlement import SettleLabel, SettlePlane
 
 
 if TYPE_CHECKING:
@@ -25,6 +26,10 @@ class ContentRangeHandler(Range):
     """  # noqa: E501
 
     __slots__ = ("start", "end", "size", "total", "headers")
+
+    #: Settlement plane/label carried by a successfully cut byte window.
+    settle_plane = SettlePlane.STATIC
+    settle_label = SettleLabel.CONTENT_RANGE
 
     def __init__(self, request: Request, stats: os.stat_result) -> None:
         self.total = stats.st_size
@@ -71,6 +76,11 @@ class ContentRangeHandler(Range):
             "Content-Range": "bytes %s-%s/%s"
             % (self.start, self.end, self.total)
         }
+
+    @property
+    def window(self) -> tuple[int, int, int]:
+        """The cut byte window as ``(start, end, total)``."""
+        return (self.start, self.end, self.total)
 
     def __bool__(self):
         return hasattr(self, "size") and self.size > 0

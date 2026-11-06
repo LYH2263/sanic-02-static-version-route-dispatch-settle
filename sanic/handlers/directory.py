@@ -12,6 +12,7 @@ from sanic.exceptions import NotFound
 from sanic.pages.directory_page import DirectoryPage, FileInfo
 from sanic.request import Request
 from sanic.response import file, html, redirect
+from sanic.settlement import SettleLabel, SettlePlane, settle_note
 
 
 def _is_path_within_root(path: Path, root: Path) -> bool:
@@ -89,9 +90,19 @@ class DirectoryHandler:
         for file_name in self.index:
             index_file = self.directory / current / file_name
             if index_file.is_file():
+                # Default page fork: a directory request settles as the
+                # configured index file rather than a fabricated file body.
+                settle_note(
+                    SettlePlane.STATIC,
+                    SettleLabel.INDEX,
+                    index=file_name,
+                )
                 return await file(index_file)
 
         if self.directory_view:
+            # Directory listing fallback fork. The label is attached inside
+            # ``_index`` only once the listing is actually rendered, since
+            # the trailing-slash redirect precedes it.
             return self._index(
                 self.directory / current, path, request.app.debug
             )
@@ -109,6 +120,7 @@ class DirectoryHandler:
             )
 
         # Render file browser
+        settle_note(SettlePlane.STATIC, SettleLabel.DIRECTORY_VIEW)
         page = DirectoryPage(self._iter_files(location), path, debug)
         return html(page.render())
 

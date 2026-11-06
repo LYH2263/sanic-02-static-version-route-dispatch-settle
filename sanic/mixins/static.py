@@ -20,6 +20,12 @@ from sanic.models.futures import FutureStatic
 from sanic.request import Request
 from sanic.response import HTTPResponse, file, file_stream, validate_file
 from sanic.response.convenience import guess_content_type
+from sanic.settlement import (
+    SettleLabel,
+    SettlePlane,
+    settle_note,
+    settlement_of,
+)
 
 
 class StaticMixin(BaseMixin, metaclass=SanicMeta):
@@ -173,9 +179,28 @@ class StaticMixin(BaseMixin, metaclass=SanicMeta):
             follow_external_symlink_dirs,
         )
         self._future_statics.add(static)
+        self._settle_declare_static(static)
 
         if apply:
             self._apply_static(static)
+
+    def _settle_declare_static(self, static: FutureStatic) -> None:
+        # Record registration evidence (file vs dir resource fork and the
+        # declared static options) when a dispatch settlement is active.
+        settlement = settlement_of(self)
+        if settlement is None:
+            return
+
+        if static.resource_type == "file":
+            resource_type = "file"
+        elif static.resource_type == "dir":
+            resource_type = "dir"
+        elif path.isfile(static.file_or_directory):
+            resource_type = "file"
+        else:
+            resource_type = "dir"
+
+        settlement.declare_static(static, resource_type)
 
 
 class StaticHandleMixin(metaclass=SanicMeta):
@@ -300,6 +325,11 @@ class StaticHandleMixin(metaclass=SanicMeta):
                 modified_since = stats.st_mtime
                 response = await validate_file(request.headers, modified_since)
                 if response:
+                    # Conditional caching terminal state: the resource is
+                    # settled without a file body.
+                    settle_note(
+                        SettlePlane.STATIC, SettleLabel.NOT_MODIFIED
+                    )
                     return response
                 headers["Last-Modified"] = formatdate(
                     modified_since, usegmt=True
@@ -334,6 +364,7 @@ class StaticHandleMixin(metaclass=SanicMeta):
             if request.method == "HEAD":
                 return HTTPResponse(headers=headers)
             else:
+                stream_response = False
                 if stream_large_files:
                     if isinstance(stream_large_files, bool):
                         threshold = 1024 * 1024
@@ -342,10 +373,33 @@ class StaticHandleMixin(metaclass=SanicMeta):
 
                     if not stats:
                         stats = await stat_async(file_path)
-                    if stats.st_size >= threshold:
-                        return await file_stream(
-                            file_path, headers=headers, _range=_range
-                        )
+                    stream_response = stats.st_size >= threshold
+
+                # Freeze exactly one terminal static label for the probe:
+                # a cut range window wins over the transport beneath it;
+                # otherwise the file vs file_stream fork is recorded.
+                if _range:
+                    settle_note(
+                        SettlePlane.STATIC,
+                        SettleLabel.CONTENT_RANGE,
+                        transport=(
+                            SettleLabel.FILE_STREAM
+                            if stream_response
+                            else SettleLabel.FILE
+                        ),
+                        window=_range.window,
+                    )
+                elif stream_response:
+                    settle_note(
+                        SettlePlane.STATIC, SettleLabel.FILE_STREAM
+                    )
+                else:
+                    settle_note(SettlePlane.STATIC, SettleLabel.FILE)
+
+                if stream_response:
+                    return await file_stream(
+                        file_path, headers=headers, _range=_range
+                    )
                 return await file(file_path, headers=headers, _range=_range)
         except (IsADirectoryError, PermissionError):
             return await directory_handler.handle(request, request.path)

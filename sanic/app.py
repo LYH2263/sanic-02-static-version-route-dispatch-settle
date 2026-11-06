@@ -181,6 +181,7 @@ class Sanic(
         "_asgi_client",
         "_blueprint_order",
         "_delayed_tasks",
+        "_dispatch_settlement",
         "_ext",
         "_future_commands",
         "_future_exceptions",
@@ -352,6 +353,8 @@ class Sanic(
         self._asgi_client: Any = None
         self._blueprint_order: list[Blueprint] = []
         self._delayed_tasks: list[str] = []
+        # Opt-in dispatch settlement; ``None`` keeps the pinned behaviour.
+        self._dispatch_settlement: Any = None
         self._future_registry: FutureRegistry = FutureRegistry()
         self._inspector: Inspector | None = None
         self._manager: WorkerManager | None = None
@@ -640,6 +643,33 @@ class Sanic(
                 exclusive=signal.exclusive,
                 priority=signal.priority,
             )
+
+    @property
+    def dispatch_settlement(self) -> Any:
+        """The active :class:`~sanic.settlement.DispatchSettlement`, if
+        declared with :meth:`declare_dispatch_settlement`, else ``None``."""
+        return self._dispatch_settlement
+
+    def declare_dispatch_settlement(self) -> Any:
+        """Declare an opt-in dispatch settlement on this application.
+
+        When declared, the application simultaneously collects registration
+        evidence from ``Router.add`` (versioned and unversioned dynamic
+        routes) and ``app.static`` (file/dir resource forks and static
+        options), and binds per-request recorders on the routing/response
+        lifecycle so that a settlement session can freeze, on the *same*
+        application, versioned hits, unversioned hits or NotFound,
+        MethodNotAllowed, and the static exits (file, file_stream,
+        not-modified, content range, index, directory view).
+
+        No new constructor argument is required; without declaring this,
+        behaviour is unchanged.
+        """
+        from sanic.settlement import DispatchSettlement
+
+        if self._dispatch_settlement is None:
+            self._dispatch_settlement = DispatchSettlement(self)
+        return self._dispatch_settlement
 
     @overload
     def dispatch(

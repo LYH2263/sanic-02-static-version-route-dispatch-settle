@@ -16,6 +16,12 @@ from sanic.constants import HTTP_METHODS
 from sanic.errorpages import check_error_format
 from sanic.exceptions import MethodNotAllowed, NotFound, SanicException
 from sanic.models.handler_types import RouteHandler
+from sanic.settlement import (
+    SettleLabel,
+    SettlePlane,
+    settle_note,
+    settlement_of,
+)
 
 
 ROUTER_CACHE_SIZE = 1024
@@ -32,23 +38,54 @@ class Router(BaseRouter):
         self, path: str, method: str, host: str | None
     ) -> tuple[Route, RouteHandler, dict[str, Any]]:
         try:
-            return self.resolve(
+            route, handler, match_info = self.resolve(
                 path=path,
                 method=method,
                 extra={"host": host} if host else None,
             )
         except RoutingNotFound as e:
-            raise NotFound(f"Requested URL {e.path} not found") from None
+            # Path-miss fork: nothing matched at all.
+            settle_note(
+                SettlePlane.DYNAMIC,
+                SettleLabel.NOT_FOUND,
+                path=e.path,
+                method=method,
+            )
+            not_found = NotFound(f"Requested URL {e.path} not found")
+            not_found.settle_plane = SettlePlane.DYNAMIC
+            not_found.settle_label = SettleLabel.NOT_FOUND
+            raise not_found from None
         except NoMethod as e:
-            raise MethodNotAllowed(
+            # Method fork: the path matched, but the method did not.
+            allowed_methods = (
+                tuple(e.allowed_methods) if e.allowed_methods else None
+            )
+            settle_note(
+                SettlePlane.DYNAMIC,
+                SettleLabel.METHOD_NOT_ALLOWED,
+                method=method,
+                path=path,
+                allowed_methods=allowed_methods,
+            )
+            method_not_allowed = MethodNotAllowed(
                 f"Method {method} not allowed for URL {path}",
                 method=method,
-                allowed_methods=tuple(e.allowed_methods)
-                if e.allowed_methods
-                else None,
-            ) from None
+                allowed_methods=allowed_methods,
+            )
+            method_not_allowed.settle_plane = SettlePlane.DYNAMIC
+            method_not_allowed.settle_label = SettleLabel.METHOD_NOT_ALLOWED
+            raise method_not_allowed from None
+
+        return route, handler, match_info
 
     @lru_cache(maxsize=ROUTER_CACHE_SIZE)
+    def _resolve(
+        self, path: str, method: str, host: str | None
+    ) -> tuple[Route, RouteHandler, dict[str, Any]]:
+        """Cached fork: a miss raises NotFound or MethodNotAllowed from
+        ``_get``; exceptions are never cached."""
+        return self._get(path, method, host)
+
     def get(  # type: ignore
         self, path: str, method: str, host: str | None
     ) -> tuple[Route, RouteHandler, dict[str, Any]]:
@@ -73,7 +110,30 @@ class Router(BaseRouter):
             Tuple[Route, RouteHandler, Dict[str, Any]]: the route, handler, and match info
         """  # noqa: E501
         __tracebackhide__ = True
-        return self._get(path, method, host)
+        route, handler, match_info = self._resolve(path, method, host)
+
+        # Tag the resolution on every call, including lru_cache hits: the
+        # NotFound/MethodNotAllowed forks above can only fire on a miss, but
+        # a successful hit still has to settle with the correct plane label
+        # even when it was resolved before the settlement opened.
+        #
+        # Static routes settle on the static plane inside
+        # ``_static_request_handler``; only dynamic routes settle here.
+        if not getattr(route.extra, "static", False):
+            label = (
+                SettleLabel.VERSIONED
+                if getattr(route.extra, "version", None) is not None
+                else SettleLabel.UNVERSIONED
+            )
+            settle_note(
+                SettlePlane.DYNAMIC,
+                label,
+                method=method,
+                path=path,
+                uri=route.path,
+            )
+
+        return route, handler, match_info
 
     def add(  # type: ignore
         self,
@@ -111,9 +171,12 @@ class Router(BaseRouter):
             Route: The route object.
         """  # noqa: E501
 
-        if version is not None:
-            version = str(version).strip("/").lstrip("v")
-            uri = "/".join([f"{version_prefix}{version}", uri.lstrip("/")])
+        # The version segment is composed onto the uri exactly once, at
+        # registration. A versioned uri and the same uri without a version
+        # are therefore two distinct registrations.
+        declared_uri = uri
+        version, uri = self._compose_version_uri(uri, version, version_prefix)
+        composed_uri = uri
 
         uri = self._normalize(uri, handler)
 
@@ -153,15 +216,49 @@ class Router(BaseRouter):
             route.extra.hosts = hosts
             route.extra.static = static
             route.extra.error_format = error_format
+            route.extra.version = version
+            route.extra.version_prefix = version_prefix
+            route.extra.composed_uri = composed_uri
 
             if error_format:
                 check_error_format(route.extra.error_format)
 
             routes.append(route)
 
+        settlement = settlement_of(getattr(self.ctx, "app", None))
+        if settlement is not None:
+            settlement.declare_route(
+                uri=declared_uri,
+                composed_uri=composed_uri,
+                version=version,
+                version_prefix=version_prefix,
+                methods=params["methods"],
+                static=static,
+            )
+
         if len(routes) == 1:
             return routes[0]
         return routes
+
+    @staticmethod
+    def _compose_version_uri(
+        uri: str,
+        version: str | float | int | None,
+        version_prefix: str,
+    ) -> tuple[str | None, str]:
+        """Normalize the version and compose the final registration uri.
+
+        ``"/settle"`` with ``version=1`` and ``version_prefix="/v"`` settles
+        as ``"/v1/settle"``. Returns the normalized version (``None`` when
+        no version was given) alongside the composed uri.
+        """
+        if version is None:
+            return None, uri
+        normalized_version = str(version).strip("/").lstrip("v")
+        composed_uri = "/".join(
+            [f"{version_prefix}{normalized_version}", uri.lstrip("/")]
+        )
+        return normalized_version, composed_uri
 
     @lru_cache(maxsize=ROUTER_CACHE_SIZE)
     def find_route_by_view_name(
